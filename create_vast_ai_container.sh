@@ -82,6 +82,17 @@ ssh-keyscan github.com >> /root/.ssh/known_hosts
 echo "Cloning ${GITHUB_REPO_SSH} into ${WORKDIR}..."
 rm -rf "${WORKDIR}" 2>/dev/null || true
 git clone "${GITHUB_REPO_SSH}" "${WORKDIR}"
+cd "${WORKDIR}" && git checkout dev
+
+# Unzip cursor-server to the correct location
+echo "Unzipping cursor-server..."
+unzip -o /cursor-server.zip -d /root/
+mv /root/cursor-server/.cursor-server /root/
+rm -rf /root/cursor-server 
+chmod -R 755 /root/.cursor-server
+
+echo "source /venv/main/bin/activate" >> /root/.bashrc
+touch /root/.no_auto_tmux
 
 git config --global user.email "pzhizhin@google.com"
 git config --global user.name "Peter Zhizhin"

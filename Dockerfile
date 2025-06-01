@@ -1,8 +1,11 @@
-FROM vastai/pytorch
+FROM vastai/pytorch:cuda-12.8.1-auto
 
-RUN python3 -m pip install --upgrade pip && \
-    python3 -m pip install numpy tqdm huggingface-hub && \
-    apt-get update && apt-get install -y git
+
+COPY cursor-server.zip /cursor-server.zip
+
+RUN . /venv/main/bin/activate && \
+    python -m pip install numpy tqdm huggingface-hub && \
+    pip install --pre --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 
 CMD ["bash"]
 ENTRYPOINT []

@@ -9,6 +9,7 @@ import glob
 from dataclasses import dataclass
 from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
+from torch.utils.tensorboard import SummaryWriter
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -277,7 +278,16 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12,
+            kernel_options = {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_M1": 32,
+                "BLOCK_N1": 64,
+                "BLOCK_M2": 64,
+                "BLOCK_N2": 32,
+            }
+        ).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -444,8 +454,8 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    train_seq_len = 16 * 1024 # 48*1024 # FlexAttention sequence length
+    val_seq_len = 32 * 1024 # 4*64*1024 # FlexAttention sequence length for validation
     # optimization
     num_iterations = 1770 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
@@ -663,64 +673,112 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
-for step in range(train_steps + 1):
-    last_step = (step == train_steps)
 
-    # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.perf_counter() - t0)
-        model.eval()
-        val_batch_size = world_size * args.val_seq_len
-        assert args.val_tokens % val_batch_size == 0
-        val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
-        val_loss = 0
-        with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets = next(val_loader)
-                val_loss += model(inputs, targets, get_window_size_blocks(step))
-        val_loss /= val_steps
-        del val_loader
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        model.train()
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
+if master_process:
+    writer = SummaryWriter(f"logs/{run_id}/tensorboard")
 
-    if last_step:
-        if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
-        # the last step only has the validation loop, so break to avoid training
-        break
+def trace_handler(prof):
+    print0(prof.key_averages().table(
+        sort_by="self_cuda_time_total", row_limit=-1))
+    # prof.export_chrome_trace("/tmp/test_trace_" + str(prof.step_num) + ".json")
 
-    # --------------- TRAINING SECTION -----------------
-    inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
-    #for param in model.parameters():
-    #    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    wait_for_gradients() # does the same thing as commented two lines above, but faster
+# Create TensorBoard log directory
+if master_process:
+    os.makedirs(f"logs/{run_id}/tensorboard", exist_ok=True)
 
-    # set optimization hyperparameters
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
-    for group in optimizer2.param_groups:
-        frac = min(step / 300, 1) # momentum warmup for muon
-        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-    # step the optimizers
-    for opt in optimizers:
-        opt.step()
-    # null the gradients
-    model.zero_grad(set_to_none=True)
-    # logging
-    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+train_steps = 10
+
+with torch.profiler.profile(
+    activities=[
+        # torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ],
+    schedule=torch.profiler.schedule(
+        wait=1,
+        warmup=1,
+        active=2,
+        repeat=1),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler(f"logs/{run_id}/tensorboard"),
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=True,
+) as prof:
+    for step in range(train_steps + 1):
+        last_step = (step == train_steps)
+
+        # --------------- VALIDATION SECTION -----------------
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            model.eval()
+            val_batch_size = world_size * args.val_seq_len
+            assert args.val_tokens % val_batch_size == 0
+            val_steps = args.val_tokens // val_batch_size
+            val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+            val_loss = 0
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    inputs, targets = next(val_loader)
+                    val_loss += model(inputs, targets, get_window_size_blocks(step))
+            val_loss /= val_steps
+            del val_loader
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            model.train()
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+            # Log validation loss to TensorBoard
+            if master_process:
+                writer.add_scalar('Loss/validation', val_loss.item(), step)
+                writer.add_scalar('Time/training_time_ms', training_time_ms, step)
+
+        if last_step:
+            if master_process and args.save_checkpoint:
+                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+                os.makedirs(f"logs/{run_id}", exist_ok=True)
+                torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            # the last step only has the validation loop, so break to avoid training
+            break
+
+        # --------------- TRAINING SECTION -----------------
+        inputs, targets = next(train_loader)
+        loss = model(inputs, targets, get_window_size_blocks(step))
+        loss.backward()
+        wait_for_gradients()
+
+        # set optimization hyperparameters
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * get_lr(step)
+        for group in optimizer2.param_groups:
+            frac = min(step / 300, 1) # momentum warmup for muon
+            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        # step the optimizers
+        for opt in optimizers:
+            opt.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
+        # logging
+        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+        
+        # Log training loss to TensorBoard
+        if master_process:
+            writer.add_scalar('Loss/train', loss.item(), step)
+            writer.add_scalar('Time/train_step_ms', approx_training_time_ms/(step + 1), step)
+            # Log learning rates
+            for i, opt in enumerate(optimizers):
+                for j, group in enumerate(opt.param_groups):
+                    writer.add_scalar(f'LR/optimizer_{i}_group_{j}', group['lr'], step)
+        
+        # Send a signal to the profiler that the next iteration has started
+        prof.step()
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+if master_process:
+    writer.close()
 dist.destroy_process_group()

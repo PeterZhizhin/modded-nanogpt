@@ -83,6 +83,9 @@ echo "Cloning ${GITHUB_REPO_SSH} into ${WORKDIR}..."
 rm -rf "${WORKDIR}" 2>/dev/null || true
 git clone "${GITHUB_REPO_SSH}" "${WORKDIR}"
 
+git config --global user.email "pzhizhin@google.com"
+git config --global user.name "Peter Zhizhin"
+
 EOF
 
 # Remove leading/trailing whitespace/newlines and join lines with " && ":

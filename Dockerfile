@@ -7,5 +7,8 @@ RUN . /venv/main/bin/activate && \
     python -m pip install numpy tqdm huggingface-hub && \
     pip install --pre --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 
+RUN . /venv/main/bin/activate && \
+    python -m pip install tensorboard torch_tb_profiler
+
 CMD ["bash"]
 ENTRYPOINT []

@@ -11,7 +11,7 @@
 # Check if OFFER_ID is provided as command line argument
 if [ $# -eq 0 ]; then
     echo "No OFFER_ID provided, searching for cheapest offer..."
-    CHEAPEST_OFFER_ID=$(vastai search offers --limit 1 -o "dph" --raw | jq -r '.[].ask_contract_id')
+    CHEAPEST_OFFER_ID=$(vastai search offers --limit 1 -o 'dph' 'compute_cap >= 1200 gpu_ram >= 16 inet_down >= 500' --raw | jq -r '.[].ask_contract_id')
     if [[ -z "${CHEAPEST_OFFER_ID}" ]]; then
         echo "Error: Failed to find any available offers"
         exit 1
